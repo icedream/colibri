@@ -153,6 +153,7 @@ static int g_cuda_enabled;
 static double g_cuda_expert_gb;
 static int g_cuda_dense;
 static int g_cuda_extend;   /* CUDA_EXTEND=1: VRAM tier holds experts BEYOND the RAM pin */
+static int g_profile_enable = 0;  /* PROFILE=1: enable timing output */
 static int g_cuda_devices[COLI_CUDA_MAX_DEVICES], g_cuda_ndev, g_cuda_rr;
 static int64_t g_cuda_dense_projected[COLI_CUDA_MAX_DEVICES];
 static void qt_cuda_reset(QT *t){
@@ -484,10 +485,14 @@ static void matmul_qt(float *y, const float *x, QT *w, int S){
     if(g_cuda_enabled && w->cuda_eligible && !w->cuda_failed && !omp_in_parallel()){
         const void *weights = w->fmt==0 ? (const void*)w->qf
                             : w->fmt==1 ? (const void*)w->q8 : (const void*)w->q4;
-        if(coli_cuda_matmul(&w->cuda,y,x,weights,w->s,w->fmt,S,w->I,w->O,w->cuda_device)) return;
-        w->cuda_failed=1;
-        fprintf(stderr,"[CUDA] tensor [%d,%d] on device %d disabled after an error; falling back to CPU\n",
-            w->O,w->I,w->cuda_device);
+        double t0 = now_s();
+        int ok = coli_cuda_matmul(&w->cuda,y,x,weights,w->s,w->fmt,S,w->I,w->O,w->cuda_device);
+        if(g_profile_enable) fprintf(stderr,"[PROFILE] cuda_matmul: %.3f ms [%d,%d]\n",(now_s()-t0)*1000,w->O,w->I);
+        if(!ok) {
+            w->cuda_failed=1;
+            fprintf(stderr,"[CUDA] tensor [%d,%d] on device %d disabled after an error; falling back to CPU\n",
+                w->O,w->I,w->cuda_device);
+        } else return;
     }
 #endif
     if(!w->qf && !w->q8 && !w->q4){
@@ -1386,10 +1391,19 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
 #endif
             for(int r=0;r<nr;r++) memcpy(xg+(int64_t)r*D, x+(int64_t)rows[r]*D, D*sizeof(float));
             double t0=now_s();
+#ifdef COLI_CUDA
+            if(g_cuda_enabled && e->g.cuda_eligible && !e->g.cuda_failed){
+                /* GPU path: timing handled in coli_cuda_matmul */
+            } else
+#endif
+            if(g_profile_enable){
+                fprintf(stderr,"[PROFILE] cpu_expert: layer=%d eid=%d nr=%d\n",layer,eid,nr);
+            }
             matmul_qt(gg, xg, &e->g, nr);
             matmul_qt(uu, xg, &e->u, nr);
             for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
             matmul_qt(hh, gg, &e->d, nr);
+            if(g_profile_enable) fprintf(stderr,"[PROFILE] cpu_expert_done: %.3f ms\n",(now_s()-t0)*1000);
 #ifdef COLI_CUDA
             if(e->vram_only && (e->g.cuda_failed||e->u.cuda_failed||e->d.cuda_failed)){
                 /* the GPU refused a VRAM-only expert mid-run: reload from disk once and
@@ -2768,6 +2782,8 @@ int main(int argc, char **argv){
         if(g_cuda_ndev<1){ fprintf(stderr,"invalid COLI_GPUS: use a list such as 0,1,2\n"); return 2; }
         g_cuda_enabled=coli_cuda_init(g_cuda_devices,g_cuda_ndev);
         if(!g_cuda_enabled){ fprintf(stderr,"[CUDA] requested backend is unavailable\n"); return 2; }
+        g_profile_enable = getenv("PROFILE")?atoi(getenv("PROFILE")):0;
+        if(g_profile_enable) fprintf(stderr,"[PROFILE] timing enabled\n");
     }
     g_cuda_dense=getenv("CUDA_DENSE")?atoi(getenv("CUDA_DENSE")):0;
     g_cuda_expert_gb=getenv("CUDA_EXPERT_GB")?atof(getenv("CUDA_EXPERT_GB")):0;

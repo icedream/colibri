@@ -4,6 +4,15 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <chrono>
+
+static auto g_t0 = std::chrono::high_resolution_clock::now();
+static int g_profile_enable = 0;
+
+static double now_ms() {
+    auto t = std::chrono::high_resolution_clock::now();
+    return std::chrono::duration<double, std::milli>(t - g_t0).count();
+}
 
 struct ColiCudaTensor {
     void *weights;
@@ -172,10 +181,15 @@ extern "C" int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
     ColiCudaTensor *t = static_cast<ColiCudaTensor *>(std::calloc(1, sizeof(*t)));
     if (!t) return 0;
     t->fmt = fmt; t->I = I; t->O = O; t->device = device; t->weight_bytes = rb * (size_t)O;
-    if (!cuda_ok(cudaMalloc(&t->weights, t->weight_bytes), "tensor allocation") ||
-        !cuda_ok(cudaMemcpy(t->weights, weights, t->weight_bytes, cudaMemcpyHostToDevice), "tensor upload")) {
-        coli_cuda_tensor_free(t);
-        return 0;
+    {
+        double t0 = now_ms();
+        int ok = cuda_ok(cudaMalloc(&t->weights, t->weight_bytes), "tensor allocation");
+        if(g_profile_enable) fprintf(stderr, "[PROFILE] tensor alloc: %.3f ms\n", now_ms()-t0);
+        if(!ok) { coli_cuda_tensor_free(t); return 0; }
+        t0 = now_ms();
+        ok = cuda_ok(cudaMemcpy(t->weights, weights, t->weight_bytes, cudaMemcpyHostToDevice), "tensor upload");
+        if(g_profile_enable) fprintf(stderr, "[PROFILE] tensor upload: %.3f ms (%zu bytes)\n", now_ms()-t0, t->weight_bytes);
+        if(!ok) { coli_cuda_tensor_free(t); return 0; }
     }
     if (fmt) {
         if (!cuda_ok(cudaMalloc(&t->scales, (size_t)O * sizeof(float)), "scale allocation") ||
