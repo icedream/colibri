@@ -27,6 +27,7 @@
 #include <stdatomic.h>                            /* PIPE: ready-flags / job queue */
 #include <sched.h>                                /* PIPE: sched_yield nello spin */
 #include <unistd.h>
+#include <errno.h>
 #if defined(__APPLE__) || defined(__linux__)
 #include <sys/resource.h>
 #include <sys/mman.h>                             /* mlock: inchioda le pagine in RAM / wire pages into RAM */
@@ -2433,17 +2434,29 @@ static void pin_wire(Model *m){
 }
 
 static void pin_load(Model *m, const char *statspath, double gb){
-    FILE *f=fopen(statspath,"r"); if(!f){ perror(statspath); return; }
     typedef struct { int l,e; uint32_t c; } Rec;
     Cfg *c=&m->c; int cap=(c->n_layers+1)*c->n_experts;
     Rec *r=malloc((size_t)cap*sizeof(Rec)); int n=0;
-    int l,e; uint32_t cnt;
-    while(n<cap && fscanf(f,"%d %d %u",&l,&e,&cnt)==3){
-        int ok = l>=0 && e>=0 && e<c->n_experts &&
-                 ((l<c->n_layers && m->L[l].sparse) || (l==c->n_layers && m->has_mtp));
-        if(ok) r[n++]=(Rec){l,e,cnt};
+    FILE *f=fopen(statspath,"r");
+    if(f){
+        /* Load from stats file */
+        int l,e; uint32_t cnt;
+        while(n<cap && fscanf(f,"%d %d %u",&l,&e,&cnt)==3){
+            int ok = l>=0 && e>=0 && e<c->n_experts &&
+                     ((l<c->n_layers && m->L[l].sparse) || (l==c->n_layers && m->has_mtp));
+            if(ok) r[n++]=(Rec){l,e,cnt};
+        }
+        fclose(f);
+    } else {
+        /* No stats file: create uniform ranking with all experts at equal frequency */
+        for(int l=0;l<=c->n_layers;l++){
+            int max_expert = (l<c->n_layers) ? c->n_experts : (m->has_mtp ? 1 : 0);
+            for(int e=0;e<max_expert;e++){
+                if(l<c->n_layers && !m->L[l].sparse) continue;  /* skip non-sparse layers */
+                r[n++]=(Rec){l,e,1};  /* uniform frequency = 1 */
+            }
+        }
     }
-    fclose(f);
     for(int a=0;a<n;a++){ int best=a;                       /* selection sort parziale, poi taglio */
         for(int b=a+1;b<n;b++) if(r[b].c>r[best].c) best=b;
         Rec t=r[a]; r[a]=r[best]; r[best]=t;
@@ -2791,14 +2804,20 @@ int main(int argc, char **argv){
     if(getenv("PIN")) pin_load(&m, getenv("PIN"), getenv("PIN_GB")?atof(getenv("PIN_GB")):10.0);
     /* CACHE CHE IMPARA: l'uso degli expert si accumula in <SNAP>/.coli_usage tra le sessioni;
      * all'avvio i piu' usati vengono auto-pinnati in RAM (meta' del budget expert: il pin
-     * conosce la TUA storia, la LRU si adatta alla sessione). AUTOPIN=0 disattiva. */
+     * conosce la TUA storia, la LRU si adatta alla sessione). AUTOPIN=0 disattiva.
+     * CUDA_EXPERT_GB>0 forza il caricamento tier VRAM anche senza storia. */
     { double ram_env = getenv("RAM_GB")?atof(getenv("RAM_GB")):0.0;
       int est_ctx = getenv("CTX")?atoi(getenv("CTX")):4096;   /* stesso default di run_serve */
       snprintf(g_usage_path,sizeof(g_usage_path),"%s/.coli_usage",snap);
       int64_t hist = usage_load(&m,g_usage_path);
       if(hist>0) fprintf(stderr,"[USAGE] expert history: %lld selections (%s)\n",(long long)hist,g_usage_path);
       int autopin = getenv("AUTOPIN")?atoi(getenv("AUTOPIN")):1;
-      if(!getenv("PIN") && autopin && hist>=5000){
+      double cuda_expert_gb = getenv("CUDA_EXPERT_GB")?atof(getenv("CUDA_EXPERT_GB")):0;
+      if(cuda_expert_gb > 0 && !getenv("PIN")){
+          /* First run without stats: use uniform ranking (all experts equal frequency)
+           * to populate VRAM tier immediately. Stats will refine ranking on subsequent runs. */
+          pin_load(&m, g_usage_path, cuda_expert_gb);
+      } else if(!getenv("PIN") && autopin && hist>=5000){
           /* quota pin proporzionale alla FIDUCIA nella storia: con pochi dati il pin
            * sbaglia expert e ruba slot alla LRU adattiva; a regime (>=200k selezioni,
            * qualche ora di chat) arriva a meta' del budget expert. */
