@@ -84,6 +84,14 @@ def memory_available():
 
 
 def discover_gpus():
+    """Discover GPUs via nvidia-smi (NVIDIA) or rocminfo (AMD/ROCm)."""
+    devices = _discover_nvidia()
+    if devices:
+        return devices
+    return _discover_rocm()
+
+
+def _discover_nvidia():
     command = ["nvidia-smi", "--query-gpu=index,name,memory.total,memory.free",
                "--format=csv,noheader,nounits"]
     try:
@@ -102,6 +110,142 @@ def discover_gpus():
         devices.append({"index": index, "name": fields[1],
                         "total_bytes": total * 1024 * 1024,
                         "free_bytes": free * 1024 * 1024})
+    return devices
+
+
+def _discover_rocm():
+    """Discover AMD GPUs via rocminfo, falling back to /sys/class/drm/ card enumeration."""
+    # Try rocminfo first (gives name + memory info)
+    devices = _discover_rocm_rocminfo()
+    if devices:
+        return devices
+    # Fallback: count amdgpu cards in /sys/class/drm/
+    return _discover_rocm_sysfs()
+
+
+def _discover_rocm_rocminfo():
+    """Parse rocminfo output for GPU devices only (filter out CPUs and ISAs)."""
+    try:
+        result = subprocess.run(["rocminfo"], text=True, capture_output=True,
+                                timeout=5, check=True)
+    except (OSError, subprocess.SubprocessError):
+        return []
+
+    devices = []
+    current_device = None
+    device_type = None  # "CPU", "GPU", or None
+    pending_name = None  # Name to assign after confirming device type
+
+    for line in result.stdout.splitlines():
+        stripped = line.strip()
+
+        # Detect agent start: "Agent N"
+        if stripped.startswith("Agent "):
+            # Save previous device if it was a GPU
+            if current_device is not None and device_type == "GPU":
+                devices.append(current_device)
+            current_device = {"index": len(devices), "name": "Unknown", "total_bytes": 0, "free_bytes": 0}
+            device_type = None
+            pending_name = None
+            continue
+
+        # Detect device type
+        if "Device Type:" in stripped:
+            if "CPU" in stripped:
+                device_type = "CPU"
+            elif "GPU" in stripped:
+                device_type = "GPU"
+            # If we have a pending name and now know it's a GPU, assign it
+            if device_type == "GPU" and pending_name and current_device:
+                current_device["name"] = pending_name
+                pending_name = None
+            continue
+
+        # Capture name before device type is known (device names come first in rocminfo)
+        if (stripped.startswith("Name:") and 
+            "Marketing Name:" not in stripped and 
+            pending_name is None and 
+            len(line) - len(line.lstrip()) < 5):
+            pending_name = stripped.split("Name:", 1)[1].strip()
+
+        # Extract memory from Pool sections (first GLOBAL pool = VRAM)
+        if device_type == "GPU" and current_device is not None and current_device["total_bytes"] == 0:
+            if stripped.startswith("Size:"):
+                try:
+                    size_str = stripped.split("Size:", 1)[1].strip()
+                    # rocminfo format: "25149440(0x17fc000) KB" -> extract decimal part
+                    if "(" in size_str:
+                        size_str = size_str.split("(")[0].strip()
+                    if size_str.startswith("0x"):
+                        mem_kb = int(size_str, 16)
+                    else:
+                        mem_kb = int(size_str.replace(",", "").strip())
+                    # rocminfo reports in KB, convert to bytes
+                    mem_bytes = mem_kb * 1024
+                    current_device["total_bytes"] = mem_bytes
+                    current_device["free_bytes"] = mem_bytes
+                except (ValueError, IndexError):
+                    pass
+
+    if current_device is not None and device_type == "GPU":
+        # Assign pending name if not yet assigned
+        if pending_name and current_device["name"] == "Unknown":
+            current_device["name"] = pending_name
+        devices.append(current_device)
+
+    return devices
+
+
+def _discover_rocm_sysfs():
+    """Enumerate AMD GPUs from /sys/class/drm/ card entries."""
+    devices = []
+    drm_path = Path("/sys/class/drm")
+    if not drm_path.exists():
+        return devices
+
+    card_index = 0
+    for card_dir in sorted(drm_path.iterdir()):
+        if not card_dir.name.startswith("card"):
+            continue
+        if not card_dir.is_symlink():
+            continue
+        device_path = card_dir / "device"
+        if not device_path.exists():
+            continue
+        # Check if it's an AMD GPU (vendor 0x1002)
+        vendor_file = device_path / "vendor"
+        if not vendor_file.exists():
+            continue
+        try:
+            vendor = int(vendor_file.read_text().strip(), 16)
+            if vendor != 0x1002:  # AMD vendor ID
+                continue
+        except (ValueError, OSError):
+            continue
+
+        # Try to read VRAM from memory_info_vram_total (kernel 5.15+)
+        total_bytes = 0
+        vram_file = device_path / "memory_info_vram_total"
+        if vram_file.exists():
+            try:
+                total_bytes = int(vram_file.read_text().strip())
+            except (ValueError, OSError):
+                pass
+
+        # Fallback: estimate from device ID or use a default
+        if total_bytes == 0:
+            # Could read device_id and look up in a table, but for now use 0
+            # The user can override with --vram
+            total_bytes = 0
+
+        devices.append({
+            "index": card_index,
+            "name": f"AMD GPU (card{card_dir.name.split('card')[1]})",
+            "total_bytes": total_bytes,
+            "free_bytes": total_bytes,  # unknown without rocminfo
+        })
+        card_index += 1
+
     return devices
 
 

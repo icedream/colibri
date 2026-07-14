@@ -107,11 +107,14 @@ def need_model(model):
         sys.exit(f"{C.yel}engine is not built.{C.r} Run: coli build")
 
 def cuda_binary():
+    """Return True if the engine binary links a GPU runtime (CUDA or HIP)."""
     if not os.path.exists(GLM) or sys.platform != "linux": return False
     try:
         linked=subprocess.run(["ldd",GLM],capture_output=True,text=True,timeout=3)
-        return any("libcudart" in line and "not found" not in line
-                   for line in linked.stdout.splitlines())
+        for line in linked.stdout.splitlines():
+            if "libcudart" in line and "not found" not in line: return True
+            if "libamdhip64" in line and "not found" not in line: return True
+        return False
     except (OSError,subprocess.SubprocessError): return False
 
 def resource_request(a, env):

@@ -17,17 +17,26 @@ def _check(identifier, status, summary, **details):
 
 
 def cuda_linkage(engine_path):
-    """Return CUDA linkage state without loading the executable or CUDA runtime."""
+    """Return CUDA/HIP linkage state without loading the executable or GPU runtime."""
     if not Path(engine_path).is_file() or os.name != "posix":
-        return {"linked": False, "missing": False}
+        return {"linked": False, "missing": False, "backend": "none"}
     try:
         result = subprocess.run(["ldd", str(engine_path)], capture_output=True, text=True,
                                 timeout=3, check=False)
     except (OSError, subprocess.SubprocessError):
-        return {"linked": False, "missing": False}
-    lines = [line for line in result.stdout.splitlines() if "libcudart" in line]
-    return {"linked": any("not found" not in line for line in lines),
-            "missing": any("not found" in line for line in lines)}
+        return {"linked": False, "missing": False, "backend": "none"}
+    
+    has_cudart = any("libcudart" in line and "not found" not in line 
+                     for line in result.stdout.splitlines())
+    has_hip = any("libamdhip64" in line and "not found" not in line 
+                  for line in result.stdout.splitlines())
+    
+    if has_cudart:
+        return {"linked": True, "missing": False, "backend": "cuda"}
+    elif has_hip:
+        return {"linked": True, "missing": False, "backend": "hip"}
+    else:
+        return {"linked": False, "missing": True, "backend": "none"}
 
 
 def run_doctor(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0, *,
@@ -84,12 +93,14 @@ def run_doctor(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0, *,
         checks.append(_check("accelerator.cuda", "fail", "one or more requested GPUs were not detected",
                              requested=gpu_indices, detected=[gpu["index"] for gpu in detected_gpus]))
     elif selected_gpus and linkage.get("missing"):
-        checks.append(_check("accelerator.cuda", "fail", "CUDA runtime library is missing"))
+        backend = linkage.get("backend", "unknown")
+        checks.append(_check("accelerator.cuda", "fail", f"{backend.upper()} runtime library is missing"))
     elif selected_gpus and linkage.get("linked"):
-        checks.append(_check("accelerator.cuda", "pass", "CUDA engine and devices are available",
+        backend = linkage.get("backend", "cuda").upper()
+        checks.append(_check("accelerator.cuda", "pass", f"{backend} engine and devices are available",
                              devices=[gpu["index"] for gpu in selected_gpus]))
     elif selected_gpus:
-        checks.append(_check("accelerator.cuda", "warn", "NVIDIA GPU detected but the engine is CPU-only",
+        checks.append(_check("accelerator.cuda", "warn", "GPU detected but the engine is CPU-only",
                              devices=[gpu["index"] for gpu in selected_gpus]))
     else:
         checks.append(_check("accelerator.cuda", "skip", "no NVIDIA GPU detected; CPU path is available"))
